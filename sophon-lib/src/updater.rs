@@ -29,6 +29,9 @@ use super::{
     },
 };
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Serialize)]
 pub enum Update {
     CheckingFreeSpace(PathBuf),
@@ -479,9 +482,7 @@ impl SophonPatcher {
             target_dir,
             from,
             updater.clone(),
-        );
-
-        Ok(())
+        )
     }
 
     fn update_multithreaded(
@@ -491,7 +492,7 @@ impl SophonPatcher {
         game_folder: impl AsRef<Path>,
         from: Version,
         updater: impl Fn(Update) + Clone + Send,
-    ) {
+    ) -> Result<(), SophonError> {
         let update_index =
             UpdateIndex::new(&self.patch_manifest, &self.diff_info.diff_download, from);
 
@@ -633,11 +634,26 @@ impl SophonPatcher {
             drop(file_patch_receiver);
         });
 
+        let patched_files = update_index
+            .files_patched
+            .load(std::sync::atomic::Ordering::Acquire);
+        let total_files = update_index.total_files();
+        if patched_files != total_files {
+            // Keep the version-detection file staged until every other file is
+            // ready. Callers must not mark this update complete or clear its cache.
+            return Err(SophonError::UpdateIncomplete {
+                patched_files,
+                total_files,
+            });
+        }
+
         if let Some(last_file_suffix) = &self.last_file_suffix {
-            self.last_file_handler(game_folder, &updater, &update_index, last_file_suffix);
+            self.last_file_handler(game_folder, &update_index, last_file_suffix)?;
         }
 
         (updater)(Update::PatchingFinished);
+
+        Ok(())
     }
 
     pub fn pre_download(
@@ -972,10 +988,9 @@ impl SophonPatcher {
     fn last_file_handler(
         &self,
         game_folder: &Path,
-        updater: impl Fn(Update),
         update_index: &UpdateIndex<'_>,
         last_file_suffix: &str,
-    ) {
+    ) -> Result<(), SophonError> {
         let last_file_path = self.files_temp().join("last_file.tmp");
         if last_file_path.exists() {
             // todo: global OnceLock/Mutex<Vec<FileInfo>> for last file(s) rather than this
@@ -986,18 +1001,17 @@ impl SophonPatcher {
                 .find(|task| task.file_manifest.asset_name.ends_with(last_file_suffix))
                 .expect("The file was encountered during download, it must exist in the index");
             let target_path = last_file_task.target_file_path(game_folder);
-            if let Err(err) = finalize_file(
+            finalize_file(
                 &last_file_path,
                 &target_path,
                 last_file_task.file_manifest.asset_size,
                 &last_file_task.file_manifest.asset_hash_md5,
-            ) {
-                tracing::error!(?err, "Failed to install last file");
-                (updater)(Update::DownloadingError(err))
-            }
+            )?;
 
             let _ = std::fs::remove_file(&last_file_path);
         }
+
+        Ok(())
     }
 
     fn file_patch_handler<'a, 'b>(
@@ -1062,7 +1076,7 @@ impl SophonPatcher {
         file_patch_task: &FilePatchInfo,
         game_folder: &Path,
     ) -> Result<(), SophonError> {
-        let target_path = file_patch_task.target_file_path(game_folder);
+        let target_path = self.patched_file_path(file_patch_task, game_folder);
 
         // isn't this double-checking? Checked during queue building iirc.
         /*
@@ -1188,16 +1202,7 @@ impl SophonPatcher {
 
         patch_loc.cleanup();
 
-        let target = if self
-            .last_file_suffix
-            .as_ref()
-            .map(|suffix| file_patch_task.file_manifest.asset_name.ends_with(suffix))
-            .unwrap_or(false)
-        {
-            self.files_temp().join("last_file.tmp")
-        } else {
-            file_patch_task.target_file_path(game_folder)
-        };
+        let target = self.patched_file_path(file_patch_task, game_folder);
 
         finalize_file(
             &tmp_out_path,
@@ -1211,6 +1216,18 @@ impl SophonPatcher {
         let _ = std::fs::remove_file(&tmp_out_path);
 
         Ok(())
+    }
+
+    fn patched_file_path(&self, task: &FilePatchInfo, game_folder: &Path) -> PathBuf {
+        if self
+            .last_file_suffix
+            .as_ref()
+            .is_some_and(|suffix| task.file_manifest.asset_name.ends_with(suffix))
+        {
+            self.files_temp().join("last_file.tmp")
+        } else {
+            task.target_file_path(game_folder)
+        }
     }
 
     /// Remove all the files that might have been created. Temporary files,

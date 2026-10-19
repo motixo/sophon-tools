@@ -72,6 +72,12 @@ pub enum SophonError {
     #[error("Failed to apply hdiff patch: {0}")]
     PatchingError(String),
 
+    #[error("Update incomplete: patched {patched_files} of {total_files} files")]
+    UpdateIncomplete {
+        patched_files: u64,
+        total_files: u64,
+    },
+
     #[error(
         "Failed to download chunk/patch, {name} size mismatch. Expected {expected}, got {got}."
     )]
