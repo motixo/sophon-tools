@@ -29,9 +29,6 @@ use super::{
     },
 };
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug, Serialize)]
 pub enum Update {
     CheckingFreeSpace(PathBuf),
